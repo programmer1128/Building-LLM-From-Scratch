@@ -1,0 +1,17 @@
+# C++ and Java build output
+/build/
+**/build/
+**/target/
+**/.gradle/
+
+# Local datasets, model weights, and generated benchmark output
+/model_building/data/
+/model_building/checkpoints/
+/model_building/benchmarks/results/
+/model_building/docs
+
+# Editor and temporary files
+.idea/
+.vscode/
+*.swp
+*.tmp

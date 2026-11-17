@@ -1,0 +1,11 @@
+Hello world! This is a basic test dataset for your simple tokenizer.
+
+Let's test some contractions: I'm, don't, can't, it's, and wouldn't.
+How about punctuation? Here is a comma, a semicolon; and a colon: right here.
+Hyphenated-words are important for state-of-the-art natural language processing.
+Numbers and symbols can be tricky: $1,234.56, 99.9%, and 10/11/2026.
+Special characters like @, #, and & shouldn't break the code.
+Email testing: contact@example.com.
+URL testing: https://www.github.com/
+What happens with    multiple      spaces and
+newlines?
