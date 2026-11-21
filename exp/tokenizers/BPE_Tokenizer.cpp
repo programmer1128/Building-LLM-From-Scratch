@@ -1,8 +1,8 @@
 #include "BPE_Tokenizer.h"
 #include <iostream>
+#include <optional>
 #include <queue>
-#include<map>
-#include <climits>
+#include <unordered_map>
 
 std::vector<std::string> BPETokenizer::preTokenization(const std::string_view &data)
 {
@@ -32,120 +32,208 @@ std::vector<std::string> BPETokenizer::preTokenization(const std::string_view &d
      return tokens;
 }
 
+//to be changed for optimisation
 //this method builds up the token Seq Map
 void BPETokenizer::buildTokenIDSeq(const std::vector<std::string>&tokens)
 {
+     //construct the individual token seq for each of the individual token chunks
      for(const std::string &token:tokens)
      {
-         //now for every token we build up the byte pair following a sliding window
-         //of size=2
-         if(tokenFreqMap.find(token)==tokenFreqMap.end())
+         //for every token build up the token seq map
+         //ex= low-> l,o,w
+         if(tokenChunkFreqMap.find(token)==tokenChunkFreqMap.end())
          {
              tokenSeqMap[token]=std::vector<uint32_t>();
              for(size_t i=0;i<token.size();i++)
              {
                  tokenSeqMap[token].push_back((uint32_t)static_cast<uint8_t>(token[i]));
-                 tokenPairCount++;
              }
-             tokenFreqMap[token]=0;
+             tokenChunkFreqMap[token]=0;
          }
-         tokenFreqMap[token]++;
+         //count the freq of this token that will be used later in weighted freq counting
+         tokenChunkFreqMap[token]++;
      }
 }
 
-void BPETokenizer::updateTokenIDSeq(const std::pair<uint32_t,uint32_t>& targetPair,
-         const uint32_t updateToken)
+//this method builds up the reverse token indexing tokenPair-> list of words having the pair
+//and builds up the tokenPairFreq Map that is later used in code for weighted freq counting
+void BPETokenizer::construct_ReverseIndexing_And_TokenPair_Freq()
 {
-     //update all the token pairs like the target pairs with the updated token
-     //the changes will be made in all the token keys of the tokenSeqMap
-     for(auto &key:tokenSeqMap)
+     for(const auto & tokenKeys:tokenChunkFreqMap)
      {
-         //now for every token key, we iterate the vector of tokenIDs and we make the
-         //update to the token ids
-         std::vector<uint32_t> updatedIDs;
-         std::vector<uint32_t>& seqIDs=key.second;
+         const std::string token=tokenKeys.first;
+         const std::vector<uint32_t>& tokenIds=tokenSeqMap[token];
+         const long long tokenChunkFreq= tokenChunkFreqMap[token];
 
-         if(seqIDs.size()<2)
+         for(size_t i=0; i<tokenIds.size();i++)
+         {
+             //build the reversed indexing of individual token pairs to the token chunks
+             if(i+1<tokenIds.size())
+             {
+                 //constructing bit masked key
+                 uint32_t id1= tokenIds[i];
+                 uint32_t id2= tokenIds[i+1];
+ 
+                 uint64_t key= static_cast<uint64_t>(id1)<<32 | id2;
+
+                 //insert the pair into the reversed indexed map
+                 if(reversedTokenMap.find(key)==reversedTokenMap.end())
+                 {
+                     reversedTokenMap[key]=std::unordered_set<std::string>();
+                 }
+                 reversedTokenMap[key].insert(token);
+ 
+                 //using the same key, we insert in the individual token pair freq map
+                 //as well, which will be later used for optimised merging in the priority
+                 //queue for the training
+                 if(tokenPairFreqMap.find(key)==tokenPairFreqMap.end())
+                 {
+                     tokenPairFreqMap[key]=0;
+                 }
+                 //weighted freq counting
+                 tokenPairFreqMap[key]+=tokenChunkFreq;
+             }
+             tokenPairCount++;
+         }
+     }
+}
+
+//this method initialises the max heap with the token pairs and the freq for the intial merge state
+void BPETokenizer::initialise_MergeRankHeap()
+{
+     //go through the token pairs in the tokenPairFreq map and push them into the heap
+     //for the intitial merge state
+     for(const auto& tokenPairKeys:tokenPairFreqMap)
+     {
+         const uint64_t key=tokenPairKeys.first;
+         const long long freq=tokenPairKeys.second;
+
+         if(freq<=1)
          {
              continue;
          }
+         mergeRankPQ.push(std::make_pair(freq,key));
+     }
+}
 
-         for(size_t i=0;i<seqIDs.size();i++)
+
+//to be changed for optimisation
+void BPETokenizer::updateTokenIDSeq(const std::pair<uint32_t, uint32_t>& targetPair,
+                                    const uint32_t updateToken)
+{
+     uint64_t targetKey = (static_cast<uint64_t>(targetPair.first) << 32) | targetPair.second;
+
+     // Move out or copy, then drop the dead inverted-index bucket for targetKey
+     std::unordered_set<std::string> chunksToUpdate = std::move(reversedTokenMap[targetKey]);
+     reversedTokenMap.erase(targetKey);
+
+     // Tracks net frequency change for every affected pair across this merge round
+     std::unordered_map<uint64_t, long long> pairDelta;
+
+     for (const std::string& tokenChunk : chunksToUpdate)
+     {
+         std::vector<uint32_t>& seqIDs = tokenSeqMap[tokenChunk];
+         if (seqIDs.size() < 2) 
          {
-             //if we find a pair that matches our target pair, we simply put the new
-             //updated token in place of it, in the new vector and skip the 2 values
-             if(i+1<seqIDs.size()&&seqIDs[i]==targetPair.first&&seqIDs[i+1]==targetPair.second)
+             continue;
+         }
+         std::vector<uint32_t> updatedIDs;
+         updatedIDs.reserve(seqIDs.size());
+
+         for (size_t i = 0; i < seqIDs.size(); i++)
+         {
+             if (i+1<seqIDs.size() && seqIDs[i] == targetPair.first && seqIDs[i + 1] == targetPair.second)
              {
                  updatedIDs.push_back(updateToken);
                  i++;
                  continue;
              }
-             updatedIDs.push_back(seqIDs[i]);
+            updatedIDs.push_back(seqIDs[i]);
          }
-         //after the updation, we make the map point to the updated new ids
-         std::swap(seqIDs,updatedIDs);
+
+         // If no merge occurred (stale entry in reversedTokenMap), skip
+         if (updatedIDs.size() == seqIDs.size()) 
+         {
+             continue;
+         }
+
+         long long chunkFreq = tokenChunkFreqMap[tokenChunk];
+
+         //subtract weighted freq of all pairs from the old sequence
+         for (size_t j = 0; j + 1 < seqIDs.size(); j++)
+         {
+             uint64_t oldKey = (static_cast<uint64_t>(seqIDs[j]) << 32) | seqIDs[j + 1];
+             pairDelta[oldKey] -= chunkFreq;
+         }
+
+         std::swap(seqIDs, updatedIDs);
+
+         //add all pairs from the new sequence and update inverted index. Here seqIDS have been
+         //swapped with the new updated ids, so we can use the same seq ids vector only
+         for (size_t j = 0; j + 1 < seqIDs.size(); j++)
+         {
+             uint64_t newKey = (static_cast<uint64_t>(seqIDs[j]) << 32) | seqIDs[j + 1];
+             pairDelta[newKey] += chunkFreq;
+             reversedTokenMap[newKey].insert(tokenChunk);
+         }
+     }
+
+    //Apply net deltas and batch-push changed pairs to the priority queue
+     for (const auto& [pairKey, delta] : pairDelta)
+     {
+         if (delta == 0) 
+         {
+             continue; // Untouched pair in the chunk; skip to avoid heap bloat
+         }
+
+         long long newFreq = (tokenPairFreqMap[pairKey] += delta);
+
+         if (newFreq <= 0)
+         {
+             tokenPairFreqMap.erase(pairKey);
+         }
+         else if (newFreq > 1)
+         {
+             mergeRankPQ.push({newFreq, pairKey});
+         }
      }
 }
 
+//to be changed for optimisation
 std::optional<std::pair<uint32_t,uint32_t>> BPETokenizer::find_Max_Freq_TokenPair()
 {
-     long long maxFreq=0;
-     std::map<std::pair<uint32_t,uint32_t>,long long> freqMap;
-     std::pair<uint32_t,uint32_t> maxFreqPair;
-     for(const auto& key:tokenSeqMap)
+     //here we have to get the max freq pair from the rank priority queue. Now the queue
+     //may hold stale entries, so first we have to verify the popping of the queue and
+     //the value of freq in our global freq map
+     while(!mergeRankPQ.empty())
      {
-         const std::string &token=key.first;
-         const std::vector<uint32_t>& seqIDs=key.second;
-         const long long tokenFreq=tokenFreqMap[token];
-         for(size_t i=0;i+1<seqIDs.size();i++)
+         auto topNode=mergeRankPQ.top();
+         long long heapFreq= topNode.first;
+         auto it = tokenPairFreqMap.find(topNode.second);
+         mergeRankPQ.pop();
+
+         if(it==tokenPairFreqMap.end()||heapFreq!=it->second)
          {
-             std::pair<uint32_t,uint32_t>p=std::make_pair(seqIDs[i],seqIDs[i+1]);
-
-             if(freqMap.find(p)==freqMap.end())
-             {
-                 freqMap[p]=0;
-             }
-             freqMap[p]+=tokenFreq;
-
+             //this is a stale entry
+             continue;
          }
-     }
 
-     for(const auto& key:freqMap)
-     {
-         //if freq is more than max freq then we just replace it.
-         std::pair<uint32_t,uint32_t> p=key.first;
-         if(maxFreq<freqMap[p])
+         if(heapFreq<=1)
          {
-             maxFreq=freqMap[p];
-             maxFreqPair=p;
+             return std::nullopt;
          }
-         else if(maxFreq==freqMap[p])
-         {
-             //in case of equality we keep the pair with the lower lexicographical pair
-             std::string s1=decoderMap[p.first];
-             std::string s2=decoderMap[p.second];
-
-             std::string p1=s1+s2;
-
-             std::string s3=decoderMap[maxFreqPair.first];
-             std::string s4=decoderMap[maxFreqPair.second];
-
-             std::string p2=s3+s4;
-
-             //now we compare p1 and p2 lexicographically and the smaller one is kept
-             if(p1<p2)
-             {
-                 maxFreqPair=p;
-             }
-         }
+         //the pairs have been bit masked to 64 bit uint64_t, so we have to 
+         //unpack them and then push them into the priority queue
+         //the first id is bit masked into the first 32 positions by bit shift left <<32
+         //and the second is or into the right next 32 positions
+       
+         //unmasking the ids
+         uint64_t pairKey= topNode.second;
+         uint32_t id1 = pairKey >> 32;
+         uint32_t id2 = pairKey & 0xFFFFFFFF;
+         return std::make_pair(id1, id2);
      }
-
-
-     if(maxFreq<=1)
-     {
-         return std::nullopt;
-     }
-     return maxFreqPair;
+     return std::nullopt;
 }
 
 void BPETokenizer::training()
@@ -195,6 +283,7 @@ void BPETokenizer::training()
          //update the token seq Map to replace the old maxFreq token pairs with new tokenID
          updateTokenIDSeq(maxFreqPair,tokenID);
          tokenID++;
+         //std::cout<<"hello\n";
          //display();
      }
 }
@@ -204,9 +293,13 @@ void BPETokenizer::init(const std::string &data)
 {
      vocabulary.clear();
      decoderMap.clear();
-     tokenFreqMap.clear();
+     tokenChunkFreqMap.clear();
      tokenSeqMap.clear();
      mergeRules.clear();
+     tokenPairFreqMap.clear();
+     reversedTokenMap.clear();
+     mergeRankPQ = {};
+     tokenPairCount = 0;
      //initilise the vocabulary and the decoder map with teh first 255 characters
      uint32_t id=0;
      for(int i=0;i<256;i++)
@@ -218,8 +311,19 @@ void BPETokenizer::init(const std::string &data)
          id++;
      }
 
+     //break the data into individual tokens
      std::vector<std::string> tokens=preTokenization(data);
+
+     //construct the token id seq
      buildTokenIDSeq(tokens);
+
+     //construct the reverse indexing and the token pair freq map
+     construct_ReverseIndexing_And_TokenPair_Freq();
+
+     //after the token Pair Freq is calculated we need to push these intial token pairs
+     //into the priroity queue mergeRankPQ
+     initialise_MergeRankHeap();
+
      //display();
      training();
 }
@@ -343,7 +447,7 @@ void BPETokenizer::display()
 {
      for(const auto &key:tokenSeqMap)
      {
-         std::cout<<key.first<<" "<<tokenFreqMap[key.first]<<" ";
+         std::cout<<key.first<<" "<<tokenChunkFreqMap[key.first]<<" ";
          for(const uint32_t& id:key.second)
          {
              std::cout<<id<<" ";
@@ -362,7 +466,7 @@ void BPETokenizer::buildTokenIDSeq(const std::vector<std::string>&tokens)
      {
          //now for every token we build up the byte pair following a sliding window
          //of size=2
-         if(tokenFreqMap.find(token)==tokenFreqMap.end())
+         if(tokenChunkFreqMap.find(token)==tokenChunkFreqMap.end())
          {
              Node* newSeqHead= nullptr;
              Node* temp=nullptr;
@@ -387,9 +491,9 @@ void BPETokenizer::buildTokenIDSeq(const std::vector<std::string>&tokens)
             //  std::cout<<"head id"<<newSeqHead->id<<" "<<"\n";
             //  std::cout<<"next id"<<temp->id<<" "<<"\n";
              //display();
-             tokenFreqMap[token]=0;
+             tokenChunkFreqMap[token]=0;
          }
-         tokenFreqMap[token]++;
+         tokenChunkFreqMap[token]++;
      }
 }
 
@@ -400,7 +504,7 @@ void BPETokenizer::display()
 {
      for(const auto &key:tokenSeqMap)
      {
-         std::cout<<key.first<<" "<<tokenFreqMap[key.first]<<" ";
+         std::cout<<key.first<<" "<<tokenChunkFreqMap[key.first]<<" ";
          Node* temp=key.second;
          int p=0;
          while(temp!=nullptr)

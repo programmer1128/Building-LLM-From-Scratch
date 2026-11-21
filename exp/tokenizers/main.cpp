@@ -10,8 +10,9 @@ int main()
 
        //  tokenizer.buildTokenIDSeq(tokens);
        //  tokenizer.display();
-
+       std::cout<<"hello\n";
        tokenizer.init(data);
+       std::cout<<"hello\n";
        tokenizer.display();
        std::cout<<"Enter the string\n";
        std::string str;
