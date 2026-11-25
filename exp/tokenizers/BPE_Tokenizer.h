@@ -1,58 +1,47 @@
 #pragma once
-#include <unordered_set>
-#include<vector>
-#include<queue>
-#include<unordered_map>
-#include<cstdint>
-#include<string>
-#include<optional>
-#include<map>
+#include <boost/unordered/unordered_flat_map.hpp>
+#include <boost/unordered/unordered_flat_set.hpp>
+#include <array>
+#include <vector>
+#include <queue>
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <string_view>
+#include <optional>
 
 class BPETokenizer
 {
       private:
 
-      class Node
+      long long tokenPairCount=0;
+
+      struct TransparentStringHash
       {
-           public:
-           uint32_t id;
-           Node* next;
-           Node* prev;
+           using is_transparent = void;
 
-
-           Node()
+           size_t operator()(std::string_view sv) const noexcept
            {
-                this->id=0;
-                this->next=nullptr;
-                this->prev=nullptr;
-           }
-
-           Node(uint32_t id)
-           {
-                this->id=id;
-                this->next=nullptr;
-                this->prev=nullptr;
+                return boost::hash<std::string_view>{}(sv);
            }
       };
 
-      long long tokenPairCount=0;
-
       //this map stores the individual token to id token->id mapping
-      std::unordered_map<std::string,uint32_t> vocabulary;
-
+      boost::unordered_flat_map<std::string, uint32_t, TransparentStringHash, std::equal_to<>> vocabulary;
+      
       //this map stores the id->token mapping, used for decoding the message
-      std::unordered_map<uint32_t,std::string> decoderMap;
+      std::vector<std::string> decoderMap;
 
       //this map stores the token chunk-> individual token list mapping
       //ex low-> l,o,w
-      std::unordered_map<std::string,std::vector<uint32_t>>tokenSeqMap;
+      boost::unordered_flat_map<std::string,std::vector<uint32_t>> tokenSeqMap;
 
       //this map stores the freq of every seen token chunk used for weighted counting
-      std::unordered_map<std::string,long long> tokenChunkFreqMap;
+      boost::unordered_flat_map<std::string,long long> tokenChunkFreqMap;
 
       //this map stores the freq of individual token pairs
       //ex (l,o)->freq
-      std::unordered_map<uint64_t, long long> tokenPairFreqMap;
+      boost::unordered_flat_map<uint64_t, long long> tokenPairFreqMap;
 
       //this map is storing the reversed indexing of individual token pairs to the 
       //token chunks where they are seen.
@@ -65,21 +54,30 @@ class BPETokenizer
       //we will be using bit masking for the pair keys. our token ids are of uint32_t
       //so we will mask by id1<<32 | id2 into uint64_t key that will be used as the key
       //in this map. We are not using ordered map to prevent the O(logn) complexity of RB tree
-      std::unordered_map<uint64_t, std::unordered_set<std::string>>reversedTokenMap;
+      boost::unordered_flat_map<uint64_t, boost::unordered_flat_set<std::string>> reversedTokenMap;
 
       //this map contains the merge rules for merging token id1, id2 to some id3. Here also
       //bit masking is used as std::pair<> cannot be used for the unordered_map key
-      std::unordered_map<uint64_t,uint32_t> mergeRules;
+      boost::unordered_flat_map<uint64_t,uint32_t> mergeRules;
+
+      //special tokens (e.g., <|endoftext|>, <|im_start|>) that bypass BPE splitting
+      boost::unordered_flat_map<std::string, uint32_t, TransparentStringHash, std::equal_to<>> specialTokens;
+      boost::unordered_flat_set<uint32_t> specialTokenIds;
+      std::vector<std::pair<std::string, uint32_t>> specialTokensByLen;
+      std::array<bool, 256> specialFirstByte{};
 
       std::priority_queue<std::pair<long long,uint64_t>> mergeRankPQ;
 
+      //used in merging during the encoding section
+      struct Part
+      {
+           uint32_t id;
+           uint32_t mergeId;
+      };
 
+      std::vector<std::string_view> preTokenization(std::string_view data) const;
 
-      size_t splitPoint(std::string_view data, size_t pos);
-
-      std::vector<std::string> preTokenization(const std::string_view &data);
-
-      void buildTokenIDSeq(const std::vector<std::string>& tokens);
+      void buildTokenIDSeq(const std::vector<std::string_view>& tokens);
 
       //this method builds up the reverse indexing token pair-> list of words containing the pair
       //and builds uo the token pair freq map used later for weighted counting
@@ -94,17 +92,37 @@ class BPETokenizer
 
       std::optional<std::pair<uint32_t,uint32_t>> find_Max_Freq_TokenPair();
 
-      void training();
+      void training(size_t maxVocabSize);
 
-      std::optional<std::vector<uint32_t>> mergeTokenIds(const std::vector<uint32_t>& tokenIds);
+      void mergeTokenIds(std::string_view data, std::vector<uint32_t>& outputTokenIDs) const;
+
+      void encodeOrdinaryInto(std::string_view data, std::vector<uint32_t>& outputTokenIDs) const;
+
+      uint32_t lookupMerge(uint32_t leftId,uint32_t rightId) const;
+
+      void rebuildSpecialTokenIndex();
+
+      uint32_t addSpecialToken(const std::string& token);
+
+      void addSpecialTokens(const std::vector<std::string>& tokens);
+
+      std::optional<uint32_t> getSpecialTokenId(std::string_view token) const;
+
+      size_t getVocabSize() const noexcept { return decoderMap.size(); }
+
+      std::vector<uint32_t> encodeOrdinary(std::string_view data) const;
 
       public:
 
-      void init(const std::string& data);
+      void init(const std::string& data, size_t maxVocabSize = std::numeric_limits<size_t>::max());
 
-      void display();
+      void save(const std::string& filePath) const;
 
-      std::vector<uint32_t> encode(const std::string& data);
+      void load(const std::string& filePath);
 
-      std::string decode(const std::vector<uint32_t>& tokenIDs);
+      void display() const;
+
+      std::vector<uint32_t> encode(std::string_view data, bool allowSpecial = true) const;
+
+      std::string decode(const std::vector<uint32_t>& tokenIDs, bool skipSpecialTokens = false) const;
 };

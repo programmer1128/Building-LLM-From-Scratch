@@ -1,46 +1,29 @@
 #include "BPE_Tokenizer.h"
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <queue>
-#include <unordered_map>
+#include <stdexcept>
+#include "SplitStateMachine.h"
 
-std::vector<std::string> BPETokenizer::preTokenization(const std::string_view &data)
+std::vector<std::string_view> BPETokenizer::preTokenization(std::string_view data) const
 {
-     std::vector<std::string> tokens;
-     std::string token="";
-     //extract the first word before the first space
-     for(size_t i=0;i<data.size();i++)
-     {
-         if(data[i]==' ')
-         {
-             //a new token with leading space has been built, so we
-             //push this into the tokens vector
-             if(!token.empty())
-             {
-                 tokens.push_back(token);
-             }
-             token="";
-         }
-         token+=data[i];
-     }
-     //push the last word incase there is no space at the end of the string
-     if(!token.empty())
-     {
-         tokens.push_back(token);
-     }
-
-     return tokens;
+     return SplitStateMachine::split(data);
 }
 
-//to be changed for optimisation
+
 //this method builds up the token Seq Map
-void BPETokenizer::buildTokenIDSeq(const std::vector<std::string>&tokens)
+void BPETokenizer::buildTokenIDSeq(const std::vector<std::string_view>& tokens)
 {
      //construct the individual token seq for each of the individual token chunks
-     for(const std::string &token:tokens)
+     for(std::string_view tokenView : tokens)
      {
          //for every token build up the token seq map
          //ex= low-> l,o,w
+         std::string token(tokenView);
          if(tokenChunkFreqMap.find(token)==tokenChunkFreqMap.end())
          {
              tokenSeqMap[token]=std::vector<uint32_t>();
@@ -79,7 +62,7 @@ void BPETokenizer::construct_ReverseIndexing_And_TokenPair_Freq()
                  //insert the pair into the reversed indexed map
                  if(reversedTokenMap.find(key)==reversedTokenMap.end())
                  {
-                     reversedTokenMap[key]=std::unordered_set<std::string>();
+                     reversedTokenMap[key]=boost::unordered_flat_set<std::string>();
                  }
                  reversedTokenMap[key].insert(token);
  
@@ -117,18 +100,19 @@ void BPETokenizer::initialise_MergeRankHeap()
 }
 
 
-//to be changed for optimisation
+//this method updates the token id sequences by merging the max freq token pairs
+//into the new token
 void BPETokenizer::updateTokenIDSeq(const std::pair<uint32_t, uint32_t>& targetPair,
                                     const uint32_t updateToken)
 {
      uint64_t targetKey = (static_cast<uint64_t>(targetPair.first) << 32) | targetPair.second;
 
      // Move out or copy, then drop the dead inverted-index bucket for targetKey
-     std::unordered_set<std::string> chunksToUpdate = std::move(reversedTokenMap[targetKey]);
+     boost::unordered_flat_set<std::string> chunksToUpdate = std::move(reversedTokenMap[targetKey]);
      reversedTokenMap.erase(targetKey);
 
      // Tracks net frequency change for every affected pair across this merge round
-     std::unordered_map<uint64_t, long long> pairDelta;
+     boost::unordered_flat_map<uint64_t, long long> pairDelta;
 
      for (const std::string& tokenChunk : chunksToUpdate)
      {
@@ -147,7 +131,7 @@ void BPETokenizer::updateTokenIDSeq(const std::pair<uint32_t, uint32_t>& targetP
                  updatedIDs.push_back(updateToken);
                  i++;
                  continue;
-             }
+             } 
             updatedIDs.push_back(seqIDs[i]);
          }
 
@@ -199,7 +183,7 @@ void BPETokenizer::updateTokenIDSeq(const std::pair<uint32_t, uint32_t>& targetP
      }
 }
 
-//to be changed for optimisation
+//finds the max freq token pair required in BPE by using alzy deletion of the priority queue
 std::optional<std::pair<uint32_t,uint32_t>> BPETokenizer::find_Max_Freq_TokenPair()
 {
      //here we have to get the max freq pair from the rank priority queue. Now the queue
@@ -236,7 +220,7 @@ std::optional<std::pair<uint32_t,uint32_t>> BPETokenizer::find_Max_Freq_TokenPai
      return std::nullopt;
 }
 
-void BPETokenizer::training()
+void BPETokenizer::training(size_t maxVocabSize)
 {
      //the training method does the pretraining of the tokenizer, where it learns how to
      //perform the merges of the token ids, into a new single token
@@ -244,14 +228,14 @@ void BPETokenizer::training()
      //the training algorithm finds the pair occuring the most number of times, from our
      //token seq map, then we replace that with a new tokenID as the concatenation of the 2 IDs
      //if 'l', 'o' pair is the most occuring, we concatenate them to 'lo' and it becomes a new
-     //ID, like this the training continues till we have the number of tokens as 1
+     //ID, like this the training continues till we reach maxVocabSize or no pairs repeat
 
      //for n tokens available, we can have at max n-1 token pairs
      tokenPairCount=tokenPairCount-1;
 
      uint32_t tokenID=256;
 
-     while(true)
+     while(tokenID < maxVocabSize)
      {
          //get the tokenID pair with the max freq
          std::optional<std::pair<uint32_t,uint32_t>> maxFreqPairOptional=find_Max_Freq_TokenPair();
@@ -268,9 +252,9 @@ void BPETokenizer::training()
          //construct new token
          std::string newToken=s1+s2;
 
-         //put new token in vocabulary and decoder map
-         vocabulary[newToken]=tokenID;
-         decoderMap[tokenID]=newToken;
+         //put new token in vocabulary (preserving lowest-rank ID on duplicate string) and decoder map
+         vocabulary.try_emplace(newToken, tokenID);
+         decoderMap.push_back(newToken);
 
          //update the mergeRulesMap
          //mergeRules[maxFreqPair]=tokenID;
@@ -289,8 +273,13 @@ void BPETokenizer::training()
 }
 
 
-void BPETokenizer::init(const std::string &data)
+void BPETokenizer::init(const std::string &data, size_t maxVocabSize)
 {
+     if (maxVocabSize < 256)
+     {
+         throw std::invalid_argument("maxVocabSize must be at least 256 for byte-level BPE");
+     }
+
      vocabulary.clear();
      decoderMap.clear();
      tokenChunkFreqMap.clear();
@@ -298,21 +287,27 @@ void BPETokenizer::init(const std::string &data)
      mergeRules.clear();
      tokenPairFreqMap.clear();
      reversedTokenMap.clear();
+     specialTokens.clear();
+     specialTokenIds.clear();
+     specialTokensByLen.clear();
+     specialFirstByte.fill(false);
      mergeRankPQ = {};
      tokenPairCount = 0;
-     //initilise the vocabulary and the decoder map with teh first 255 characters
+     //initilise the vocabulary and the decoder map with the first 256 byte values
      uint32_t id=0;
+     decoderMap.resize(256);
+     
      for(int i=0;i<256;i++)
      {
          std::string token(1, static_cast<char>(i));
-         vocabulary[token]=id;
+         vocabulary.try_emplace(token, id);
          decoderMap[id]=token;
          //std::cout<<decoderMap[id]<<"\n";
          id++;
      }
 
      //break the data into individual tokens
-     std::vector<std::string> tokens=preTokenization(data);
+     std::vector<std::string_view> tokens=preTokenization(data);
 
      //construct the token id seq
      buildTokenIDSeq(tokens);
@@ -325,129 +320,311 @@ void BPETokenizer::init(const std::string &data)
      initialise_MergeRankHeap();
 
      //display();
-     training();
+     training(maxVocabSize);
 }
 
-std::optional<std::vector<uint32_t>> BPETokenizer::mergeTokenIds(const std::vector<uint32_t>& tokenIds)
+
+uint32_t BPETokenizer::lookupMerge(uint32_t leftId, uint32_t rightId) const
 {
-     std::vector<uint32_t> mergedTokenIDs;
-     std::optional<std::pair<uint32_t,uint32_t>> mergePair=std::nullopt;
-     uint32_t rank= UINT32_MAX;
-     for(size_t i=0;i<tokenIds.size();i++)
+     uint64_t pairKey = (static_cast<uint64_t>(leftId) << 32) | rightId;
+     auto it = mergeRules.find(pairKey);
+     return (it != mergeRules.end()) ? it->second : UINT32_MAX;
+}
+
+void BPETokenizer::mergeTokenIds(std::string_view chunk, std::vector<uint32_t>& outputTokenIDs) const
+{
+     if(chunk.empty())
      {
-         if(i+1<tokenIds.size())
+         return;
+     }
+     thread_local std::vector<Part> parts;
+     parts.clear();
+     const size_t n= chunk.size();
+     parts.resize(n);
+
+     for(size_t i=0;i<chunk.size();i++)
+     {
+         parts[i].id=static_cast<uint32_t>(static_cast<uint8_t>(chunk[i]));
+     }
+
+     for(size_t i=0;i+1<n;i++)
+     {
+         parts[i].mergeId = lookupMerge(parts[i].id, parts[i + 1].id);
+     }
+     parts[n-1].mergeId=UINT32_MAX;
+
+     //now we keep on merging till there are no valid rules to merge
+     //since parts have id and merge id for index and after merging the next
+     //index drops out, it will continue to merge till there is no merge rule existing
+     //for the tokens available
+     while(true)
+     {
+         uint32_t minMergedId = UINT32_MAX;
+         size_t minIdx = 0;
+
+         // Pure integer scan in L1 cache (strict '<' preserves leftmost tie-break)
+         for (size_t i = 0;i+1< parts.size(); ++i)
          {
-             std::pair<uint32_t,uint32_t>p=std::make_pair(tokenIds[i],tokenIds[i+1]);
-
-             uint64_t pairKey= static_cast<uint64_t>(tokenIds[i])<<32 | tokenIds[i+1];
-
-             if(mergeRules.find(pairKey)!=mergeRules.end())
+             if (parts[i].mergeId < minMergedId)
              {
-                 uint32_t tokenPairRank=mergeRules[pairKey]-256;
-                 if(rank>tokenPairRank)
-                 {
-                     mergePair=p;
-                     rank=tokenPairRank;
-                 }
+                 minMergedId=parts[i].mergeId;
+                 minIdx = i;
              }
          }
+
+         if (minMergedId == UINT32_MAX)
+         {
+             break;
+         }
+
+         //merge in-place and drop the consumed right neighbor
+         parts[minIdx].id = minMergedId;
+         parts.erase(parts.begin() + minIdx + 1);
+
+         //recompute only the 2 affected neighbor pairs (at most 2 hash lookups)
+         if (minIdx > 0)
+         {
+             parts[minIdx - 1].mergeId=lookupMerge(parts[minIdx - 1].id, parts[minIdx].id);
+         }
+         if (minIdx + 1 < parts.size())
+         {
+             parts[minIdx].mergeId=lookupMerge(parts[minIdx].id, parts[minIdx + 1].id);
+         }
+         else
+         {
+             parts[minIdx].mergeId = UINT32_MAX;
+         }
      }
-     //if not a single pair in the current vector has a rule, then we return the nullopt
-     if(!mergePair.has_value())
+
+     //push the final token ids to the output token vector
+     for(const Part& p:parts)
+     {
+         outputTokenIDs.push_back(p.id);
+     }
+}
+
+void BPETokenizer::rebuildSpecialTokenIndex()
+{
+     specialTokenIds.clear();
+     specialTokensByLen.clear();
+     specialFirstByte.fill(false);
+
+     specialTokenIds.reserve(specialTokens.size());
+     specialTokensByLen.reserve(specialTokens.size());
+
+     for (const auto& [tokenStr, id] : specialTokens)
+     {
+         specialTokenIds.insert(id);
+         specialTokensByLen.emplace_back(tokenStr, id);
+         if (!tokenStr.empty())
+         {
+             specialFirstByte[static_cast<uint8_t>(tokenStr[0])] = true;
+         }
+     }
+
+     // Sort longest-first so prefix overlaps (e.g., "<|end|>" vs "<|endoftext|>") match greedily
+     std::sort(specialTokensByLen.begin(), specialTokensByLen.end(),
+               [](const auto& a, const auto& b) {
+                   if (a.first.size() != b.first.size())
+                   {
+                       return a.first.size() > b.first.size();
+                   }
+                   return a.second < b.second;
+               });
+}
+
+uint32_t BPETokenizer::addSpecialToken(const std::string& token)
+{
+     if (decoderMap.size() < 256)
+     {
+         throw std::logic_error("Initialize or load tokenizer before adding special tokens");
+     }
+     if (token.empty())
+     {
+         throw std::invalid_argument("Special token cannot be empty");
+     }
+
+     auto it = specialTokens.find(token);
+     if (it != specialTokens.end())
+     {
+         return it->second;
+     }
+
+     uint32_t newId = static_cast<uint32_t>(decoderMap.size());
+     decoderMap.push_back(token);
+     specialTokens.emplace(token, newId);
+     rebuildSpecialTokenIndex();
+     return newId;
+}
+
+void BPETokenizer::addSpecialTokens(const std::vector<std::string>& tokens)
+{
+     if (decoderMap.size() < 256)
+     {
+         throw std::logic_error("Initialize or load tokenizer before adding special tokens");
+     }
+
+     bool addedAny = false;
+     for (const std::string& token : tokens)
+     {
+         if (token.empty())
+         {
+             throw std::invalid_argument("Special token cannot be empty");
+         }
+         if (specialTokens.find(token) != specialTokens.end())
+         {
+             continue;
+         }
+         uint32_t newId = static_cast<uint32_t>(decoderMap.size());
+         decoderMap.push_back(token);
+         specialTokens.emplace(token, newId);
+         addedAny = true;
+     }
+
+     if (addedAny)
+     {
+         rebuildSpecialTokenIndex();
+     }
+}
+
+std::optional<uint32_t> BPETokenizer::getSpecialTokenId(std::string_view token) const
+{
+     auto it = specialTokens.find(token);
+     if (it == specialTokens.end())
      {
          return std::nullopt;
      }
+     return it->second;
+}
 
-     //if there is a valid mergePair, we update the vector
-     std::pair<uint32_t,uint32_t> validMergePair=*mergePair;
-     uint32_t first=validMergePair.first;
-     uint32_t sec=validMergePair.second;
-     for(size_t i=0;i<tokenIds.size();i++)
+void BPETokenizer::encodeOrdinaryInto(std::string_view data, std::vector<uint32_t>& outputTokenIDs) const
+{
+     if (data.empty())
      {
-         if(i+1<tokenIds.size()&&tokenIds[i]==first&&tokenIds[i+1]==sec)
+         return;
+     }
+
+     std::vector<std::string_view> tokens = preTokenization(data);
+
+     for (const std::string_view vt : tokens)
+     {
+         if (vt.size() == 1)
          {
-             //valid pair, so we merge them
-             uint64_t pairKey= static_cast<uint64_t>(first)<<32 | sec;
-             mergedTokenIDs.push_back(mergeRules[pairKey]);
-             i++;
+             outputTokenIDs.push_back(static_cast<uint32_t>(static_cast<uint8_t>(vt[0])));
              continue;
          }
-         //if not a valid pair, then we just push the current id
-         mergedTokenIDs.push_back(tokenIds[i]);
+         auto it = vocabulary.find(vt);
+
+         if (it != vocabulary.end())
+         {
+             outputTokenIDs.push_back(it->second);
+             continue;
+         }
+
+         mergeTokenIds(vt, outputTokenIDs);
      }
-     return mergedTokenIDs;
 }
 
-std::vector<uint32_t> BPETokenizer::encode(const std::string& data)
+std::vector<uint32_t> BPETokenizer::encodeOrdinary(std::string_view data) const
 {
-     //get the broken down tokens using the same preTokenization method
-     std::vector<std::string> tokens= preTokenization(data);
+     std::vector<uint32_t> outputTokenIDs;
+     outputTokenIDs.reserve(data.size() / 3);
+     encodeOrdinaryInto(data, outputTokenIDs);
+     return outputTokenIDs;
+}
 
-     std::unordered_map<std::string,std::vector<uint32_t>> tokenVectorMap;
-
-     //vector for the merged token ids
-     std::vector<uint32_t> tokenIDs;
-
-     for(const std::string& token:tokens)
+std::vector<uint32_t> BPETokenizer::encode(std::string_view data, bool allowSpecial) const
+{
+     if (!allowSpecial || specialTokensByLen.empty())
      {
-         if(tokenVectorMap.find(token)==tokenVectorMap.end())
+         return encodeOrdinary(data);
+     }
+
+     std::vector<uint32_t> outputTokenIDs;
+     outputTokenIDs.reserve(data.size() / 3);
+
+     size_t ordinaryStart = 0;
+     size_t scan = 0;
+
+     while (scan < data.size())
+     {
+         if (specialFirstByte[static_cast<uint8_t>(data[scan])])
          {
-             tokenVectorMap[token]=std::vector<uint32_t>();
-             for(size_t i=0;i<token.size();i++)
+             std::string_view remaining = data.substr(scan);
+             bool matched = false;
+
+             for (const auto& [specialStr, specialId] : specialTokensByLen)
              {
-                 tokenVectorMap[token].push_back((uint32_t)static_cast<uint8_t>(token[i]));
+                 if (remaining.starts_with(specialStr))
+                 {
+                     if (scan > ordinaryStart)
+                     {
+                         encodeOrdinaryInto(data.substr(ordinaryStart, scan - ordinaryStart), outputTokenIDs);
+                     }
+                     outputTokenIDs.push_back(specialId);
+                     scan += specialStr.size();
+                     ordinaryStart = scan;
+                     matched = true;
+                     break;
+                 }
+             }
+
+             if (matched)
+             {
+                 continue;
              }
          }
+         ++scan;
      }
 
-     for(auto & key:tokenVectorMap)
+     if (ordinaryStart < data.size())
      {
-         //now for every set of vector, we continue to merge token ids in it, till there
-         //is no rule available for the set of token ids
-         std::vector<uint32_t> mergedTokens(key.second);
-         while(true)
-         {
-             std::optional<std::vector<uint32_t>> mergedTokensOptional=mergeTokenIds(mergedTokens);
-             if(!mergedTokensOptional.has_value())
-             {
-                 //no rule condition
-                 break;
-             }
-             //if there was a rule, and merge was performed, then we replace the merged token vector
-             mergedTokens=*mergedTokensOptional;
-         }
-         //append the new set of merged tokens into the tokenID vector
-         std::swap(key.second,mergedTokens);
+         encodeOrdinaryInto(data.substr(ordinaryStart), outputTokenIDs);
      }
 
-     for(const std::string &token:tokens)
-     {
-         tokenIDs.append_range(tokenVectorMap.at(token));
-     }
-
-     return tokenIDs;
+     return outputTokenIDs;
 }
 
 
-std::string BPETokenizer::decode(const std::vector<uint32_t>& tokenIDs)
+std::string BPETokenizer::decode(const std::vector<uint32_t>& tokenIDs, bool skipSpecialTokens) const
 {
-     std::string decodedText="";
-     for(const uint32_t &tokenId:tokenIDs)
+     size_t totalBytes = 0;
+     for (uint32_t id : tokenIDs)
      {
-         if(decoderMap.find(tokenId)!=decoderMap.end())
+         if (id >= decoderMap.size())
          {
-             decodedText+=decoderMap[tokenId];
+             throw std::out_of_range("Token ID out of vocabulary range during decode");
          }
+         if (skipSpecialTokens && specialTokenIds.contains(id))
+         {
+             continue;
+         }
+         totalBytes += decoderMap[id].size();
      }
+
+     //single exact heap allocation
+     std::string decodedText;
+     decodedText.reserve(totalBytes);
+
+     //sequential copy into pre-allocated buffer
+     for (uint32_t id : tokenIDs)
+     {
+         if (skipSpecialTokens && specialTokenIds.contains(id))
+         {
+             continue;
+         }
+         decodedText.append(decoderMap[id]);
+     }
+
      return decodedText;
 }
 
 
-void BPETokenizer::display()
+void BPETokenizer::display() const
 {
      for(const auto &key:tokenSeqMap)
      {
-         std::cout<<key.first<<" "<<tokenChunkFreqMap[key.first]<<" ";
+         std::cout<<key.first<<" "<<tokenChunkFreqMap.at(key.first)<<" ";
          for(const uint32_t& id:key.second)
          {
              std::cout<<id<<" ";
@@ -457,62 +634,217 @@ void BPETokenizer::display()
 }
 
 
-/*
-
-//this method builds up the token Seq Map
-void BPETokenizer::buildTokenIDSeq(const std::vector<std::string>&tokens)
+namespace
 {
-     for(const std::string &token:tokens)
+    constexpr char kMagic[4] = {'A', 'B', 'P', 'E'};
+    constexpr uint32_t kFormatVersion = 1;
+    constexpr uint32_t kMaxSerializedMerges = 10'000'000;
+    constexpr uint32_t kMaxSerializedSpecials = 1'000'000;
+    constexpr uint32_t kMaxSpecialTokenLen = 65'536;
+
+    struct DiskMergeRecord
+    {
+        uint32_t leftId;
+        uint32_t rightId;
+        uint32_t newId;
+    };
+    static_assert(sizeof(DiskMergeRecord) == 12, "DiskMergeRecord must be tightly packed");
+}
+
+void BPETokenizer::save(const std::string& filePath) const
+{
+     if (decoderMap.size() < 256)
      {
-         //now for every token we build up the byte pair following a sliding window
-         //of size=2
-         if(tokenChunkFreqMap.find(token)==tokenChunkFreqMap.end())
-         {
-             Node* newSeqHead= nullptr;
-             Node* temp=nullptr;
-             for(size_t i=0;i<token.size();i++)
-             {
-                 //push the token ids
-                 if(newSeqHead==nullptr)
-                 {
-                     newSeqHead= new Node((uint32_t)(token[i]));
-                     temp=newSeqHead;
-                 }
-                 else
-                 {
-                     Node* newNode= new Node((uint32_t)(token[i]));
-                     temp->next=newNode;
-                     newNode->prev=temp;
-                     temp=temp->next;
-                 }
-                 tokenPairCount++;
-             }
-             tokenSeqMap[token]=newSeqHead;
-            //  std::cout<<"head id"<<newSeqHead->id<<" "<<"\n";
-            //  std::cout<<"next id"<<temp->id<<" "<<"\n";
-             //display();
-             tokenChunkFreqMap[token]=0;
-         }
-         tokenChunkFreqMap[token]++;
+         throw std::logic_error("Cannot save an uninitialized tokenizer");
+     }
+
+     std::ofstream out(filePath, std::ios::binary | std::ios::trunc);
+     if (!out)
+     {
+         throw std::runtime_error("Failed to open file for writing: " + filePath);
+     }
+
+     //write file header
+     out.write(kMagic, sizeof(kMagic));
+     out.write(reinterpret_cast<const char*>(&kFormatVersion), sizeof(kFormatVersion));
+
+     //extract and sort merge rules by newId ascending (preserves rank order)
+     std::vector<DiskMergeRecord> sortedMerges;
+     sortedMerges.reserve(mergeRules.size());
+
+     for (const auto& [pairKey, newId] : mergeRules)
+     {
+         uint32_t leftId = static_cast<uint32_t>(pairKey >> 32);
+         uint32_t rightId = static_cast<uint32_t>(pairKey & 0xFFFFFFFFULL);
+         sortedMerges.push_back({leftId, rightId, newId});
+     }
+
+     std::sort(sortedMerges.begin(), sortedMerges.end(),
+            [](const DiskMergeRecord& a, const DiskMergeRecord& b) {
+                 return a.newId < b.newId;
+     });
+
+     uint32_t numMerges = static_cast<uint32_t>(sortedMerges.size());
+     out.write(reinterpret_cast<const char*>(&numMerges), sizeof(numMerges));
+
+     if (!sortedMerges.empty())
+     {
+         out.write(reinterpret_cast<const char*>(sortedMerges.data()),
+                  static_cast<std::streamsize>(sortedMerges.size() * sizeof(DiskMergeRecord)));
+     }
+
+     //sort special tokens by id ascending for deterministic binary output
+     std::vector<std::pair<uint32_t, std::string_view>> sortedSpecials;
+     sortedSpecials.reserve(specialTokens.size());
+     for (const auto& [tokenStr, id] : specialTokens)
+     {
+         sortedSpecials.emplace_back(id, tokenStr);
+     }
+     std::sort(sortedSpecials.begin(), sortedSpecials.end(),
+               [](const auto& a, const auto& b) {
+                   return a.first < b.first;
+               });
+
+     //write special tokens: [count] followed by [id][len][raw bytes]
+     uint32_t numSpecials = static_cast<uint32_t>(sortedSpecials.size());
+     out.write(reinterpret_cast<const char*>(&numSpecials), sizeof(numSpecials));
+
+     for (const auto& [id, tokenStr] : sortedSpecials)
+     {
+         uint32_t len = static_cast<uint32_t>(tokenStr.size());
+         out.write(reinterpret_cast<const char*>(&id), sizeof(id));
+         out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+         out.write(tokenStr.data(), static_cast<std::streamsize>(len));
+     }
+
+     if (!out.good())
+     {
+         throw std::runtime_error("I/O error while writing tokenizer binary: " + filePath);
      }
 }
 
-
-
-
-void BPETokenizer::display()
+void BPETokenizer::load(const std::string& filePath)
 {
-     for(const auto &key:tokenSeqMap)
+     std::ifstream in(filePath, std::ios::binary);
+     if (!in)
      {
-         std::cout<<key.first<<" "<<tokenChunkFreqMap[key.first]<<" ";
-         Node* temp=key.second;
-         int p=0;
-         while(temp!=nullptr)
-         {
-             std::cout<<temp->id<<" ";
-             temp=temp->next;
-             p++;
-         }
-         std::cout<<"\n";
+         throw std::runtime_error("Failed to open tokenizer file: " + filePath);
      }
-}*/
+
+     //validate magic bytes and format version
+     char magic[4]{};
+     uint32_t version = 0;
+     in.read(magic, sizeof(magic));
+     in.read(reinterpret_cast<char*>(&version), sizeof(version));
+
+     if (!in || std::memcmp(magic, kMagic, sizeof(kMagic)) != 0)
+     {
+         throw std::runtime_error("Invalid tokenizer file magic header");
+     }
+     if (version != kFormatVersion)
+     {
+         throw std::runtime_error("Unsupported tokenizer binary version");
+     }
+
+     //read merge records in bulk (validate stream & bounds BEFORE allocating)
+     uint32_t numMerges = 0;
+     in.read(reinterpret_cast<char*>(&numMerges), sizeof(numMerges));
+     if (!in || numMerges > kMaxSerializedMerges)
+     {
+         throw std::runtime_error("Corrupted or invalid merge count in tokenizer file: " + filePath);
+     }
+
+     std::vector<DiskMergeRecord> sortedMerges(numMerges);
+     if (numMerges > 0)
+     {
+         in.read(reinterpret_cast<char*>(sortedMerges.data()),
+                 static_cast<std::streamsize>(numMerges * sizeof(DiskMergeRecord)));
+         if (!in)
+         {
+             throw std::runtime_error("Truncated merge table in tokenizer file: " + filePath);
+         }
+     }
+
+     //reset ALL state (including any stale training structures) and rebuild base 0..255 bytes
+     mergeRules.clear();
+     vocabulary.clear();
+     tokenChunkFreqMap.clear();
+     tokenSeqMap.clear();
+     tokenPairFreqMap.clear();
+     reversedTokenMap.clear();
+     mergeRankPQ = {};
+     tokenPairCount = 0;
+     specialTokens.clear();
+     specialTokenIds.clear();
+     specialTokensByLen.clear();
+     specialFirstByte.fill(false);
+
+     decoderMap.assign(256, std::string{});
+     mergeRules.reserve(numMerges);
+     vocabulary.reserve(256 + numMerges);
+     decoderMap.reserve(256 + numMerges);
+
+     for (uint32_t i = 0; i < 256; ++i)
+     {
+         decoderMap[i] = std::string(1, static_cast<char>(i));
+         vocabulary.try_emplace(decoderMap[i], i);
+     }
+
+     //replay merges in rank order to populate mergeRules, decoderMap, and vocabulary
+     for (uint32_t idx = 0; idx < numMerges; ++idx)
+     {
+         const DiskMergeRecord& rec = sortedMerges[idx];
+         uint32_t expectedId = 256 + idx;
+         if (rec.newId != expectedId || rec.leftId >= decoderMap.size() || rec.rightId >= decoderMap.size())
+         {
+             throw std::runtime_error("Corrupted merge record: invalid or out-of-order token ID");
+         }
+
+         uint64_t pairKey = (static_cast<uint64_t>(rec.leftId) << 32) | rec.rightId;
+         mergeRules.emplace(pairKey, rec.newId);
+
+         std::string mergedStr = decoderMap[rec.leftId] + decoderMap[rec.rightId];
+         decoderMap.push_back(mergedStr);
+         vocabulary.try_emplace(std::move(mergedStr), rec.newId);
+     }
+
+     //read and register special tokens
+     uint32_t numSpecials = 0;
+     in.read(reinterpret_cast<char*>(&numSpecials), sizeof(numSpecials));
+     if (!in || numSpecials > kMaxSerializedSpecials)
+     {
+         throw std::runtime_error("Corrupted or invalid special token count in tokenizer file: " + filePath);
+     }
+
+     for (uint32_t i = 0; i < numSpecials; ++i)
+     {
+         uint32_t id = 0;
+         uint32_t len = 0;
+         in.read(reinterpret_cast<char*>(&id), sizeof(id));
+         in.read(reinterpret_cast<char*>(&len), sizeof(len));
+         if (!in || len == 0 || len > kMaxSpecialTokenLen)
+         {
+             throw std::runtime_error("Corrupted special token header in tokenizer file: " + filePath);
+         }
+         if (id < 256 + numMerges || id >= 256 + numMerges + kMaxSerializedSpecials)
+         {
+             throw std::runtime_error("Corrupted special token ID out of valid range");
+         }
+
+         std::string tokenStr(len, '\0');
+         in.read(tokenStr.data(), static_cast<std::streamsize>(len));
+         if (!in)
+         {
+             throw std::runtime_error("Truncated special token payload in tokenizer file: " + filePath);
+         }
+
+         if (id >= decoderMap.size())
+         {
+             decoderMap.resize(id + 1);
+         }
+         decoderMap[id] = tokenStr;
+         specialTokens.emplace(std::move(tokenStr), id);
+     }
+
+     rebuildSpecialTokenIndex();
+}
