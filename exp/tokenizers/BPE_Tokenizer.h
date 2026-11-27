@@ -15,6 +15,7 @@ class BPETokenizer
       private:
 
       long long tokenPairCount=0;
+      bool hasImportedRanks = false;
 
       struct TransparentStringHash
       {
@@ -104,13 +105,13 @@ class BPETokenizer
 
       uint32_t addSpecialToken(const std::string& token);
 
-      void addSpecialTokens(const std::vector<std::string>& tokens);
-
       std::optional<uint32_t> getSpecialTokenId(std::string_view token) const;
 
       size_t getVocabSize() const noexcept { return decoderMap.size(); }
 
       std::vector<uint32_t> encodeOrdinary(std::string_view data) const;
+
+      void addSpecialTokens(const std::vector<std::string>& tokens);
 
       public:
 

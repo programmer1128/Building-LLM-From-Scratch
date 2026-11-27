@@ -1,0 +1,27 @@
+# ==============================================================================
+# DataLoader Configuration
+# ==============================================================================
+# Adjust hyperparameters here without recompiling C++ sources.
+# Note: All TOML integers are signed 64-bit; negative values are rejected.
+
+[dataloader]
+# Context window length (T): number of tokens per input/target sequence.
+sequence_length = 256
+
+# Sliding window step size (S) between consecutive samples.
+# Set equal to sequence_length for non-overlapping pretraining windows.
+stride = 256
+
+# Micro-batch size (B): number of sequences per batch.
+# Adjust per GPU VRAM budget (e.g., smaller on T4, larger on A100/H100).
+batch_size = 8
+
+# Shuffle sample order at the start of each epoch (true for train, false for val).
+shuffle = true
+
+# Drop the final partial batch if total samples are not divisible by batch_size.
+# Recommended: false, to keep dataset coverage identical across micro-batch sizes.
+drop_last = false
+
+# Base deterministic RNG seed for reproducible shuffling and checkpoint resumes.
+seed = 42

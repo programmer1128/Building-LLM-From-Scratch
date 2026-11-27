@@ -10,9 +10,7 @@ int main()
 
        //  tokenizer.buildTokenIDSeq(tokens);
        //  tokenizer.display();
-       std::cout<<"hello\n";
        tokenizer.init(data);
-       std::cout<<"hello\n";
        tokenizer.display();
        std::cout<<"Enter the string\n";
        std::string str;
@@ -23,8 +21,10 @@ int main()
        {
              std::cout<<id<<" ";
        }
-       std::cout<<"\n";
+       std::cout<<"\n\n";
 
-       std::cout<<tokenizer.decode(tokenIDs);
+       std::cout<<tokenizer.decode(tokenIDs)<<"\n";
+
+
        return 0;
 }

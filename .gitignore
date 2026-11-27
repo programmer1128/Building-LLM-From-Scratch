@@ -15,3 +15,6 @@
 .vscode/
 *.swp
 *.tmp
+/testing/tokenizer-bench-*/
+/testing/**/__pycache__/
+/testing/.pytest_cache/

@@ -280,6 +280,7 @@ void BPETokenizer::init(const std::string &data, size_t maxVocabSize)
          throw std::invalid_argument("maxVocabSize must be at least 256 for byte-level BPE");
      }
 
+     hasImportedRanks = false;
      vocabulary.clear();
      decoderMap.clear();
      tokenChunkFreqMap.clear();
@@ -653,6 +654,11 @@ namespace
 
 void BPETokenizer::save(const std::string& filePath) const
 {
+     if (hasImportedRanks)
+     {
+          throw std::logic_error("ABPE v1 cannot store imported rank vocabularies");
+     }
+
      if (decoderMap.size() < 256)
      {
          throw std::logic_error("Cannot save an uninitialized tokenizer");
@@ -764,6 +770,8 @@ void BPETokenizer::load(const std::string& filePath)
              throw std::runtime_error("Truncated merge table in tokenizer file: " + filePath);
          }
      }
+
+     hasImportedRanks = false;
 
      //reset ALL state (including any stale training structures) and rebuild base 0..255 bytes
      mergeRules.clear();
