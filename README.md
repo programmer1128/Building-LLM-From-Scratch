@@ -2,10 +2,6 @@
 
 This repository implements a language model from scratch in C++.
 
-## Tokenizer release report
-
-On 25 November 2026, the C++ tokenizer missed exact `cl100k_base` compatibility on three Unicode inputs. It encoded the generated mixed text faster, while tiktoken encoded every tested 64 KiB unbroken span faster. [OpenAI tiktoken 0.14.0](https://github.com/openai/tiktoken/tree/0.14.0)
-
 ### Exact IDs and byte preservation
 
 | Input | Full sequences matching tiktoken | Exact byte round trips, both engines |
