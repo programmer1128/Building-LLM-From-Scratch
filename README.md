@@ -19,7 +19,7 @@ A minimal failing input is `U+32A0C U+09BE U+09B2`. The C++ output in official I
 
 Median wall time over three measured passes per engine, converted to decimal MB/s. Each engine used the same inputs and one thread pinned to logical CPU 0.
 
-| Mixed text | C++ encode | tiktoken encode | C++ decode | tiktoken decode |
+| Mixed text | C++ encode (MB/s) | tiktoken encode (MB/s) | C++ decode (MB/s) | tiktoken decode (MB/s) |
 | --- | ---: | ---: | ---: | ---: |
 | 1 MB | 60.00 | 11.66 | 501.22 | 133.09 |
 | 10 MB | 59.34 | 11.45 | 479.28 | 118.26 |
